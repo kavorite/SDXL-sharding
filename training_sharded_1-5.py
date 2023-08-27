@@ -1,36 +1,24 @@
-
-import json
 import ast
 import gc
-
-import jax
-import jaxlib
-import jax.numpy as jnp
-import numpy as np
-from PIL import Image
+import json
 from typing import Union
-from PIL import Image
-import optax
-from flax.training import train_state
-
-from diffusers import (
-    FlaxAutoencoderKL,
-    FlaxDDPMScheduler,
-    FlaxStableDiffusionPipeline,
-    # FlaxUNet2DConditionModel,
-)
-from models import FlaxUNet2DConditionModel
-from transformers import CLIPFeatureExtractor, CLIPTokenizer, FlaxCLIPTextModel
 
 import diffusers.schedulers.scheduling_ddim_flax
-
+import flax.traverse_util as ftu
+import jax
+import jax.numpy as jnp
+import jaxlib
+import numpy as np
+import optax
+from diffusers import FlaxAutoencoderKL  # FlaxUNet2DConditionModel,
+from diffusers import FlaxDDPMScheduler, FlaxStableDiffusionPipeline
+from flax.training import train_state
 from jax.experimental import mesh_utils
-from jax.sharding import PositionalSharding
+from jax.sharding import Mesh, NamedSharding, PartitionSpec, PositionalSharding
+from PIL import Image
+from transformers import CLIPFeatureExtractor, CLIPTokenizer, FlaxCLIPTextModel
 
-from jax.sharding import Mesh
-from jax.sharding import PartitionSpec
-from jax.sharding import NamedSharding
-from jax.experimental import mesh_utils
+from models import FlaxUNet2DConditionModel
 
 P = PartitionSpec
 # adjust this sharding mesh to create appropriate sharding rule
@@ -38,8 +26,8 @@ P = PartitionSpec
 # (1,8) = model parallel
 # (8,1) = data parallel
 # (4,2)/(2,4) = model data parallel
-devices = mesh_utils.create_device_mesh((1,8))
-mesh = Mesh(devices, axis_names=('dp', 'mp')) 
+devices = mesh_utils.create_device_mesh((1, 8))
+mesh = Mesh(devices, axis_names=("dp", "mp"))
 
 
 # global var
@@ -61,7 +49,7 @@ strip_bos_eos_token = True
 
 def read_json_file(file_path):
     try:
-        with open(file_path, 'r') as json_file:
+        with open(file_path, "r") as json_file:
             data_dict = json.load(json_file)
         return data_dict
     except FileNotFoundError:
@@ -71,8 +59,8 @@ def read_json_file(file_path):
         print(f"Error decoding JSON in file: {file_path}")
         return None
 
-def save_model_tree_as_json(file_name: str, params: dict) -> None:
 
+def save_model_tree_as_json(file_name: str, params: dict) -> None:
     # Save the dictionary as JSON
     with open(file_name, "w") as json_file:
         json.dump(params, json_file)
@@ -91,11 +79,12 @@ def shard_weight_column(model_params: jnp.array):
         param_dim_count = len(model_params.shape)
 
         if param_dim_count > 1:
-
             # just putting 1 as placeholder
             # example [1,1,1,8] which replicate
 
-            sharding_rule = sharding.reshape([1] * (param_dim_count - 1) + [device_count])
+            sharding_rule = sharding.reshape(
+                [1] * (param_dim_count - 1) + [device_count]
+            )
 
             model_params = jax.device_put(model_params, sharding_rule)
 
@@ -109,26 +98,30 @@ def shard_weight_column(model_params: jnp.array):
     return model_params
 
 
-# convert it as actual sharding 
-def predefined_sharding(layouts:dict) -> dict:
+# convert it as actual sharding
+def predefined_sharding(layouts: dict) -> dict:
     # convert list as sharding and none as replicate
     def _convert(param):
         if param != None:
             param = sharding.reshape(param)
         else:
-            param = sharding.replicate() 
+            param = sharding.replicate()
         return param
+
     layouts = jax.tree_map(lambda x: _convert(ast.literal_eval(x)), layouts)
     return layouts
 
-# convert it as actual sharding 
-def predefined_mesh_sharding(layouts:dict) -> dict:
+
+# convert it as actual sharding
+def predefined_mesh_sharding(layouts: dict) -> dict:
     # convert string like (None, 'mp') to actual tuple and turn it to sharding rule
     def _convert(param):
         param = NamedSharding(mesh, P(*param))
         return param
+
     layouts = jax.tree_map(lambda x: _convert(ast.literal_eval(x)), layouts)
     return layouts
+
 
 def shard_remainder_state_param(param_leaf):
     # if it already sharded then ignore it
@@ -154,8 +147,9 @@ def all_same_bool_values(d):
     return values
 
 
-
-model_dir = "/home/teor/secondary_storage/tpu8/model/fluffyrock-576-704-832-960-1088-lion-e130"
+model_dir = (
+    "/home/teor/secondary_storage/tpu8/model/fluffyrock-576-704-832-960-1088-lion-e130"
+)
 # load the model params and model object
 
 tokenizer = CLIPTokenizer.from_pretrained(model_dir, subfolder="tokenizer")
@@ -167,6 +161,13 @@ unet, unet_params = FlaxUNet2DConditionModel.from_pretrained(
 text_encoder, text_encoder_params = FlaxCLIPTextModel.from_pretrained(
     model_dir, subfolder="text_encoder", dtype=jnp.bfloat16, _do_init=False
 )
+
+posemb = text_encoder_params["text_model"]["embeddings"]["position_embedding"][
+    "embedding"
+]
+text_encoder_params["text_model"]["embeddings"]["position_embedding"][
+    "embedding"
+] = jnp.zeros_like(posemb)
 
 vae, vae_params = FlaxAutoencoderKL.from_pretrained(
     model_dir,
@@ -202,9 +203,21 @@ vae_params_shard_layout = predefined_mesh_sharding(vae_params_shard_layout)
 
 # NOTE: there's must be a way to define shard without materializing this to TPU!
 # init the state in cpu first then manually shard the state perhaps hmmm
-unet_params = jax.tree_map(lambda params, layout: jax.device_put(params, device=layout), unet_params, unet_params_shard_layout)
-text_encoder_params = jax.tree_map(lambda params, layout: jax.device_put(params, device=layout), text_encoder_params, text_encoder_shard_layout)
-vae_params = jax.tree_map(lambda params, layout: jax.device_put(params, device=layout), vae_params, vae_params_shard_layout)
+unet_params = jax.tree_map(
+    lambda params, layout: jax.device_put(params, device=layout),
+    unet_params,
+    unet_params_shard_layout,
+)
+text_encoder_params = jax.tree_map(
+    lambda params, layout: jax.device_put(params, device=layout),
+    text_encoder_params,
+    text_encoder_shard_layout,
+)
+vae_params = jax.tree_map(
+    lambda params, layout: jax.device_put(params, device=layout),
+    vae_params,
+    vae_params_shard_layout,
+)
 
 u_net_constant_scheduler = optax.constant_schedule(
     u_net_learning_rate / adam_to_lion_scale_factor
@@ -239,15 +252,13 @@ text_encoder_optimizer = optax.chain(
 
 
 unet_state = train_state.TrainState.create(
-    apply_fn=unet.__call__,
-    params=unet_params,
-    tx=u_net_optimizer
+    apply_fn=unet.__call__, params=unet_params, tx=u_net_optimizer
 )
 
 text_encoder_state = train_state.TrainState.create(
     apply_fn=text_encoder.__call__,
     params=text_encoder_params,
-    tx=text_encoder_optimizer
+    tx=text_encoder_optimizer,
 )
 
 # delete previous params because state creates a copy of it and occupy a memory
@@ -255,27 +266,29 @@ del unet_params
 del text_encoder_params
 gc.collect()
 
-def train_step(unet_state, text_encoder_state, vae_params, batch, train_rng:jax.random.PRNGKey):
+
+def train_step(
+    unet_state, text_encoder_state, vae_params, batch, train_rng: jax.random.PRNGKey
+):
+    import flax.traverse_util as ftu
+
     # generate rng and return new_train_rng to be used for the next iteration step
     # rng is comunicated though device aparently
-    dropout_rng, sample_rng, new_train_rng = jax.random.split(
-        train_rng, num=3)
+    dropout_rng, sample_rng, new_train_rng = jax.random.split(train_rng, num=3)
 
-
-    # trainable params is passed as an argument while 
+    # trainable params is passed as an argument while
     # non trainable params are implicitly referenced in loss calculation
-    params = {
-        "text_encoder": text_encoder_state.params,
-        "unet": unet_state.params
-    }
+    params = {"text_encoder": text_encoder_state.params, "unet": unet_state.params}
 
-    def compute_loss(params):
+    def compute_loss(params, frozen):
+        params = ftu.unflatten_dict({**params, **frozen})
+        del frozen
         # Convert images to latent space
         vae_outputs = vae.apply(
             {"params": vae_params},
             batch["pixel_values"],
             deterministic=True,
-            method=vae.encode
+            method=vae.encode,
         )
 
         # get sample distribution from VAE latent
@@ -287,16 +300,17 @@ def train_step(unet_state, text_encoder_state, vae_params, batch, train_rng:jax.
 
         # Sample noise that we'll add to the latents
         # I think I should combine this with the first noise seed generator
-        noise_offset_rng, noise_rng, timestep_rng = jax.random.split(
-            sample_rng, num=3)
+        noise_offset_rng, noise_rng, timestep_rng = jax.random.split(sample_rng, num=3)
         noise = jax.random.normal(noise_rng, latents.shape)
         if use_offset_noise:
             # mean offset noise, why add offset?
             # here https://www.crosslabs.org//blog/diffusion-with-offset-noise
-            noise_offset = jax.random.normal(
-                noise_offset_rng,
-                (latents.shape[0], latents.shape[1], 1, 1)
-            ) * 0.1
+            noise_offset = (
+                jax.random.normal(
+                    noise_offset_rng, (latents.shape[0], latents.shape[1], 1, 1)
+                )
+                * 0.1
+            )
             noise = noise + noise_offset
 
         # Sample a random timestep for each image
@@ -311,17 +325,14 @@ def train_step(unet_state, text_encoder_state, vae_params, batch, train_rng:jax.
         # Add noise to the latents according to the noise magnitude at each timestep
         # (this is the forward diffusion process)
         noisy_latents = noise_scheduler.add_noise(
-            noise_scheduler_state,
-            latents,
-            noise,
-            timesteps
+            noise_scheduler_state, latents, noise, timesteps
         )
         print(batch["input_ids"].shape)
         encoder_hidden_states = text_encoder_state.apply_fn(
             batch["input_ids"],
             params=params["text_encoder"],
             dropout_rng=dropout_rng,
-            train=True
+            train=True,
         )[0]
         print(encoder_hidden_states.shape)
         # reshape encoder_hidden_states to shape (batch, token_append, token, hidden_states)
@@ -342,20 +353,19 @@ def train_step(unet_state, text_encoder_state, vae_params, batch, train_rng:jax.
                         (
                             encoder_hidden_states.shape[0],
                             -1,
-                            encoder_hidden_states.shape[-1]
-                        )
+                            encoder_hidden_states.shape[-1],
+                        ),
                     ),
                     # last encoder hidden states without bos token
-                    encoder_hidden_states[:, -1, 1:, :]
+                    encoder_hidden_states[:, -1, 1:, :],
                 ],
-                axis=1
+                axis=1,
             )
         else:
             # reshape encoder_hidden_states to shape (batch, token_append & token, hidden_states)
             encoder_hidden_states = jnp.reshape(
                 encoder_hidden_states,
-                (encoder_hidden_states.shape[0], -
-                    1, encoder_hidden_states.shape[-1])
+                (encoder_hidden_states.shape[0], -1, encoder_hidden_states.shape[-1]),
             )
         print(encoder_hidden_states.shape)
 
@@ -366,7 +376,7 @@ def train_step(unet_state, text_encoder_state, vae_params, batch, train_rng:jax.
             noisy_latents,
             timesteps,
             encoder_hidden_states,
-            train=True
+            train=True,
         ).sample
 
         # Get the target for loss depending on the prediction type
@@ -375,15 +385,13 @@ def train_step(unet_state, text_encoder_state, vae_params, batch, train_rng:jax.
             target = noise
         elif noise_scheduler.config.prediction_type == "v_prediction":
             target = noise_scheduler.get_velocity(
-                noise_scheduler_state,
-                latents,
-                noise,
-                timesteps
+                noise_scheduler_state, latents, noise, timesteps
             )
         else:
             # panic!!
             raise ValueError(
-                f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+                f"Unknown prediction type {noise_scheduler.config.prediction_type}"
+            )
 
         # MSE loss
         loss = (target - model_pred) ** 2
@@ -392,18 +400,26 @@ def train_step(unet_state, text_encoder_state, vae_params, batch, train_rng:jax.
         return loss
 
     # perform autograd
+
+    params = ftu.flatten_dict(params)
+    posemb_path = ("text_encoder", "embeddings", "position_embedding", "embedding")
+    frozen = {posemb_path: params.pop(posemb_path)}
     grad_fn = jax.value_and_grad(compute_loss)
-    loss, grad = grad_fn(params)
+    loss, grad = grad_fn(params, frozen)
+    grad[posemb_path] = jnp.zeros_like(params[posemb_path])
+    grad = ftu.unflatten_dict(grad)
 
     # update weight and bias value
     new_unet_state = unet_state.apply_gradients(grads=grad["unet"])
     new_text_encoder_state = text_encoder_state.apply_gradients(
-        grads=grad["text_encoder"])
+        grads=grad["text_encoder"]
+    )
 
     # calculate loss
     metrics = {"loss": loss}
 
-    return new_unet_state, new_text_encoder_state, metrics, new_train_rng # 
+    return new_unet_state, new_text_encoder_state, metrics, new_train_rng  #
+
 
 # ===============[compile to device]=============== #
 
@@ -413,40 +429,39 @@ def train_step(unet_state, text_encoder_state, vae_params, batch, train_rng:jax.
 train_rngs = rng(2)
 # dummy batch input
 current_batch = {
-    'attention_mask': jnp.arange(2 * 1 * 3 * 77).reshape(2 * 1, 3, 77), 
-    'input_ids': jnp.arange(2 * 3 * 77).reshape(2 * 3, 77), 
-    'pixel_values': jax.random.uniform(train_rngs, shape=(2 * 1, 3, 512, 512))
+    "attention_mask": jnp.arange(2 * 1 * 3 * 77).reshape(2 * 1, 3, 77),
+    "input_ids": jnp.arange(2 * 3 * 77).reshape(2 * 3, 77),
+    "pixel_values": jax.random.uniform(train_rngs, shape=(2 * 1, 3, 512, 512)),
 }
 # current_batch_shard_layout = {
-#     'attention_mask': sharding.replicate(), 
-#     'input_ids': sharding.replicate(), 
+#     'attention_mask': sharding.replicate(),
+#     'input_ids': sharding.replicate(),
 #     'pixel_values': sharding.replicate()
 # }
 current_batch_shard_layout = {
-    'attention_mask': NamedSharding(mesh, P()), 
-    'input_ids': NamedSharding(mesh, P()), 
-    'pixel_values': NamedSharding(mesh, P()),
+    "attention_mask": NamedSharding(mesh, P()),
+    "input_ids": NamedSharding(mesh, P()),
+    "pixel_values": NamedSharding(mesh, P()),
 }
 
 
 p_train_step = jax.jit(
-    train_step , 
-    donate_argnums=(0, 1), 
+    train_step,
+    donate_argnums=(0, 1),
     in_shardings=(
         jax.tree_map(lambda x: shard_remainder_state_param(x), unet_state),
         jax.tree_map(lambda x: shard_remainder_state_param(x), text_encoder_state),
         jax.tree_map(lambda x: shard_remainder_state_param(x), vae_params),
         current_batch_shard_layout,
-        NamedSharding(mesh, P()),# sharding.replicate()
+        NamedSharding(mesh, P()),  # sharding.replicate()
     ),
     out_shardings=(
         jax.tree_map(lambda x: shard_remainder_state_param(x), unet_state),
         jax.tree_map(lambda x: shard_remainder_state_param(x), text_encoder_state),
-        {"loss":  NamedSharding(mesh, P())},
-        NamedSharding(mesh, P()), # sharding.replicate() # not sure about this 
-    )
+        {"loss": NamedSharding(mesh, P())},
+        NamedSharding(mesh, P()),  # sharding.replicate() # not sure about this
+    ),
 )
-
 
 
 batch = jax.tree_map(
@@ -454,11 +469,7 @@ batch = jax.tree_map(
 )
 
 unet_state, text_encoder_state, metrics, train_rngs = p_train_step(
-    unet_state,
-    text_encoder_state,
-    vae_params,
-    batch,
-    train_rngs
+    unet_state, text_encoder_state, vae_params, batch, train_rngs
 )
 # jax.profiler.stop_trace()
 
